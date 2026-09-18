@@ -11,36 +11,38 @@ on:
 permissions:
   contents: read
   pull-requests: write
-  security-events: write
 
 # ── Jobs ──────────────────────────────────────────────────────────────────────
 jobs:
 
-  # ── Job 1: Terraform Format ────────────────────────────────────────────────
+  # ── Job 1: Terraform Format ─────────────────────────────────────────────────
   fmt:
     name: Terraform Format
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
+
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "1.6.0"
+          terraform_version: "1.6.2"
+
       - name: Check formatting
         run: terraform fmt -check -recursive terraform/
 
-  # ── Job 2: Terraform Validate ──────────────────────────────────────────────
-    validate:
+
+  # ── Job 2: Terraform Validate ───────────────────────────────────────────────
+  validate:
     name: Terraform Validate
     runs-on: ubuntu-latest
-    needs: fmt  
+    needs: fmt
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "1.6.0"
+          terraform_version: "1.6.2"
 
       - name: Init
         run: terraform -chdir=terraform init -backend=false
@@ -48,23 +50,18 @@ jobs:
       - name: Validate
         run: terraform -chdir=terraform validate
 
-  # ── Job 3: Checkov Security Scan ───────────────────────────────────────────
+
+  # ── Job 3: Checkov Security Scan ────────────────────────────────────────────
   checkov:
     name: Checkov Security Scan
     runs-on: ubuntu-latest
-    needs: validate  
+    needs: validate
 
     steps:
       - uses: actions/checkout@v4
 
-      # Runs the official Checkov GitHub Action.
-      # output_format: cli,sarif — produces two outputs simultaneously:
-      #   cli    → printed to the Actions log for developer inspection
-      #   sarif  → written to results.sarif for GitHub Security tab upload
-      # output_file_path: console,results.sarif — cli goes to stdout,
-      #   sarif is saved as a file for the next step to upload.
-      # No soft_fail_on — any finding fails the job.
       - name: Run Checkov
+        id: checkov
         uses: bridgecrewio/checkov-action@v12
         with:
           directory: terraform/
@@ -72,96 +69,80 @@ jobs:
           output_format: cli,sarif
           output_file_path: console,results.sarif
 
-      # Uploads the SARIF file to the GitHub Security tab.
-      # This enables two features:
-      #   1. Security → Code scanning alerts: persistent finding list with
-      #      file path, line number, rule ID, and description.
-      #   2. Inline PR annotations: findings appear directly on the diff
-      #      at the exact line of code that caused them.
-      # "if: always()" ensures the upload runs even if Checkov failed,
-      # so findings are visible in the Security tab on a blocked PR.
-      # No Bridgecrew API key required — SARIF works without authentication.
-      - name: Upload SARIF to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: results.sarif
-          category: checkov
-
-      # Posts a summary comment on the pull request showing:
-      #   - overall pass/fail status
-      #   - total number of findings
-      #   - a table of findings with rule ID, resource, and file location
-      # "if: always()" ensures the comment posts even when Checkov failed.
-      # Old bot comments are deleted before posting to avoid clutter —
-      # each push produces one clean, up-to-date comment.
+      # Post the Checkov results to the PR.
+      # Runs even when Checkov finds violations.
       - name: Post PR comment
         uses: actions/github-script@v7
         if: always() && github.event_name == 'pull_request'
         with:
           script: |
             const fs = require('fs');
-
             let body = '';
 
             try {
-              // Parse the SARIF file written by Checkov
-              const sarif   = JSON.parse(fs.readFileSync('results.sarif', 'utf8'));
+              const sarif = JSON.parse(
+                fs.readFileSync('results.sarif', 'utf8')
+              );
 
-              // Flatten all findings from all runs into a single array
-              const results = sarif.runs?.flatMap(r => r.results || []) || [];
+              const results =
+                sarif.runs?.flatMap(r => r.results || []) || [];
 
-              // Determine overall pass/fail from the job status environment variable
-              const passed = '${{ job.status }}' === 'success';
-              const emoji  = passed ? '✅' : '🚨';
-              const gate   = passed ? 'PASSED' : 'FAILED';
-              const total  = results.length;
+              const passed =
+                '${{ steps.checkov.outcome }}' === 'success';
 
-              // Build the findings detail table (capped at 15 rows to avoid huge comments)
-              let table = '';
-              if (results.length > 0) {
-                table += '\n\n**Findings:**\n\n';
-                table += '| Rule | Resource | File |\n';
-                table += '|---|---|---|\n';
+              const rows = results.map(r => {
+                const rule = r.ruleId || 'N/A';
+                const resource =
+                  r.message?.text?.split('\n')[0] || 'N/A';
 
-                results.slice(0, 15).forEach(r => {
-                  const rule     = r.ruleId || 'N/A';
-                  const resource = r.message?.text?.split('\n')[0] || 'N/A';
-                  const file     = r.locations?.[0]?.physicalLocation?.artifactLocation?.uri || 'N/A';
-                  const line     = r.locations?.[0]?.physicalLocation?.region?.startLine || '';
-                  table += `| \`${rule}\` | ${resource} | ${file}:${line} |\n`;
-                });
+                const location =
+                  r.locations?.[0]?.physicalLocation;
 
-                // If there are more than 15 findings, point to the Security tab
-                if (results.length > 15) {
-                  table += `\n_...and ${results.length - 15} more. See the Security tab._`;
-                }
-              }
+                const file =
+                  location?.artifactLocation?.uri || 'N/A';
 
-              // Build the full comment body
-              body = `## ${emoji} IaC Security Scan — ${gate}
+                const line =
+                  location?.region?.startLine || '';
+
+                return `| \`${rule}\` | ${resource} | ${file}:${line} |`;
+              }).join('\n');
+
+              const table = results.length
+                ? `
+
+            ### Findings
+
+            | Rule | Resource | File |
+            |---|---|---|
+            ${rows}`
+                : '';
+
+              body = `## ${passed ? '✅' : '🚨'} IaC Security Scan — ${passed ? 'PASSED' : 'FAILED'}
 
             | Metric | Value |
             |---|---|
-            | Total findings | **${total}** |
+            | Total findings | **${results.length}** |
             | Status | ${passed ? '🟢 No issues found' : '🔴 Issues detected'} |
 
-            ${passed
-              ? '> No Checkov findings detected. This PR may be merged.'
-              : '> Checkov found misconfigurations. Fix all findings before merging.\n> View findings in the [Security tab](' + context.payload.repository.html_url + '/security/code-scanning).'
+            ${
+              passed
+                ? '> No Checkov findings detected. This PR may be merged.'
+                : '> Checkov found security violations. Fix all findings before merging.'
             }
             ${table}
 
             ---
-            <sub>Scanned by [Checkov](https://checkov.io) · iCorp IaC Security Pipeline · commit \`${context.sha.slice(0, 7)}\`</sub>`;
+            <sub>Checkov · iCorp IaC Security Pipeline · commit \`${context.sha.slice(0, 7)}\`</sub>`;
 
-            } catch (e) {
-              // If SARIF parsing fails, post a fallback error comment
-              body = `## ⚠️ IaC Security Scan — ERROR\n\nCould not parse results. Check the [Actions log](${context.payload.repository.html_url}/actions).`;
+            } catch (error) {
+              body = `## ⚠️ IaC Security Scan — ERROR
+
+            Unable to read Checkov results.
+
+            Check the GitHub Actions log for details.`;
             }
 
-            // Delete all previous bot comments that contain "IaC Security Scan"
-            // This keeps the PR clean — only one comment per scan
+            // Remove previous Checkov comments
             const comments = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -169,7 +150,10 @@ jobs:
             });
 
             for (const comment of comments.data) {
-              if (comment.user.type === 'Bot' && comment.body.includes('IaC Security Scan')) {
+              if (
+                comment.user.type === 'Bot' &&
+                comment.body.includes('IaC Security Scan')
+              ) {
                 await github.rest.issues.deleteComment({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
@@ -178,7 +162,7 @@ jobs:
               }
             }
 
-            // Post the new comment on the PR
+            // Post the new comment
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -186,17 +170,17 @@ jobs:
               body
             });
 
-  # ── Job 4: Security Gate ───────────────────────────────────────────────────
+
+  # ── Job 4: Security Gate ────────────────────────────────────────────────────
   security-gate:
     name: Security Gate
     runs-on: ubuntu-latest
     needs: checkov
-    if: always()  # runs even if checkov failed, errored, or was skipped
+    if: always()
 
     steps:
       - name: Evaluate gate
         run: |
-          # Case 1: Checkov completed and found issues — block the PR
           if [ "${{ needs.checkov.result }}" = "failure" ]; then
             echo "════════════════════════════════════════"
             echo "  SECURITY GATE: FAILED"
@@ -206,8 +190,6 @@ jobs:
             exit 1
           fi
 
-          # Case 2: Checkov did not complete successfully (error/skip/cancel)
-          # This closes the bypass gap — an incomplete scan also blocks the PR
           if [ "${{ needs.checkov.result }}" != "success" ]; then
             echo "════════════════════════════════════════"
             echo "  SECURITY GATE: FAILED"
@@ -218,7 +200,6 @@ jobs:
             exit 1
           fi
 
-          # Case 3: Checkov passed — allow the PR to merge
           echo "════════════════════════════════════════"
           echo "  SECURITY GATE: PASSED"
           echo "  No Checkov findings detected."
